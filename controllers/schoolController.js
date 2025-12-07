@@ -1,16 +1,20 @@
-const schoolService = require('../services/schoolService');
+const schoolService = require("../services/schoolService");
 
 const proxyUdise = async (req, res) => {
   try {
-    // req.url here comes from the router.use('/udise')
-    // It will be whatever is AFTER /api/udise
-    const result = await schoolService.proxyUdiseRequest(req.method, req.url, req.body);
+    const result = await schoolService.proxyUdiseRequest(
+      req.method,
+      req.url,
+      req.body
+    );
     res.json(result);
   } catch (error) {
     if (error.status) {
       res.status(error.status).json(error.data || { message: error.message });
     } else {
-      res.status(500).json({ message: 'Internal Server Error', error: error.message });
+      res
+        .status(500)
+        .json({ message: "Internal Server Error", error: error.message });
     }
   }
 };
@@ -19,13 +23,27 @@ const saveSchools = async (req, res) => {
   try {
     const schoolsData = req.body;
     if (!Array.isArray(schoolsData) || schoolsData.length === 0) {
-      return res.status(400).json({ message: 'No data provided' });
+      return res.status(400).json({ message: "No data provided" });
     }
     const result = await schoolService.saveSchoolsToDb(schoolsData);
-    res.json({ success: true, message: `Saved ${result.count} records.`, count: result.count });
+    res.json({
+      success: true,
+      message: `Saved ${result.count} records.`,
+      count: result.count,
+    });
   } catch (err) {
-    console.error('Controller Error:', err);
-    res.status(500).json({ success: false, message: 'Database error', error: err.message });
+    console.error("Controller Error:", err);
+    // Handle Duplicate Key Error gracefully
+    if (err.code === "23505") {
+      return res.json({
+        success: true,
+        message: "Some records were skipped (already exist).",
+        count: 0,
+      });
+    }
+    res
+      .status(500)
+      .json({ success: false, message: "Database error", error: err.message });
   }
 };
 
@@ -34,7 +52,7 @@ const getFilters = async (req, res) => {
     const filters = await schoolService.getFiltersFromDb();
     res.json(filters);
   } catch (err) {
-    res.status(500).json({ error: 'Failed to fetch filters' });
+    res.status(500).json({ error: "Failed to fetch filters" });
   }
 };
 
@@ -44,8 +62,29 @@ const searchSchools = async (req, res) => {
     const data = await schoolService.searchSchoolsInDb(state, districts);
     res.json(data);
   } catch (err) {
-    res.status(500).json({ error: 'Failed to fetch data' });
+    res.status(500).json({ error: "Failed to fetch data" });
   }
 };
 
-module.exports = { proxyUdise, saveSchools, getFilters, searchSchools };
+// NEW: Check for Existing Codes
+const checkExisting = async (req, res) => {
+  try {
+    const { codes } = req.body;
+    if (!codes || !Array.isArray(codes))
+      return res.status(400).json({ error: "Invalid codes array" });
+
+    const existingCodes = await schoolService.getExistingCodes(codes);
+    res.json({ existing: existingCodes });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Failed to check existing records" });
+  }
+};
+
+module.exports = {
+  proxyUdise,
+  saveSchools,
+  getFilters,
+  searchSchools,
+  checkExisting,
+};

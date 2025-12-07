@@ -7,123 +7,156 @@ const axios = require("axios");
 
 const TABLE_NAME = "udise_data";
 
-// --- 1. DEFINE CORE COLUMNS ---
-// These are the columns you frequently query/filter by. 
-// Everything else will be stored in the 'details' JSONB column.
-const CORE_COLUMNS = [
-  "udise_code", 
-  "school_name", 
-  "school_id", 
-  "state", 
-  "district", 
-  "block", 
-  "cluster", 
-  "village", 
-  "school_management", 
-  "school_category", 
-  "school_type", 
-  "school_location",
-  "is_operational", 
-  "ay", 
-  "lati", 
-  "long", 
-  "total_students",
-  "local_id" // Auto-generated
-];
+// --- Service: Fetch from External UDISE API ---
+const proxyUdiseRequest = async (method, url, data) => {
+  const targetBaseUrl = "https://kys.udiseplus.gov.in/webapp/api";
+  const targetUrl = `${targetBaseUrl}${url}`;
 
-// --- Service: Save Data to DB (Hybrid JSONB Approach) ---
+  try {
+    const response = await axios({
+      method: method,
+      url: targetUrl,
+      data: method === "POST" || method === "PUT" ? data : undefined,
+      headers: {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        Accept: "application/json, text/plain, */*",
+        Origin: "https://kys.udiseplus.gov.in",
+        Referer: "https://kys.udiseplus.gov.in/",
+      },
+    });
+    return response.data;
+  } catch (error) {
+    if (error.response) {
+      throw { status: error.response.status, data: error.response.data };
+    }
+    throw { status: 500, message: "Error proxying request", error: error.message };
+  }
+};
+
+// --- Service: Get Existing Codes ---
+const getExistingCodes = async (codes) => {
+  if (!codes || codes.length === 0) return [];
+  
+  // Check if table exists first
+  const checkTable = await pool.query(format("SELECT to_regclass(%L)", TABLE_NAME));
+  if (!checkTable.rows[0].to_regclass) return [];
+
+  const query = format("SELECT udise_code FROM %I WHERE udise_code IN (%L)", TABLE_NAME, codes);
+  const result = await pool.query(query);
+  return result.rows.map(r => r.udise_code);
+};
+
+// --- Service: Save Data to DB (Fixed Schema & Constraints) ---
 const saveSchoolsToDb = async (schoolsData) => {
   if (!schoolsData || schoolsData.length === 0) return { success: false, count: 0 };
 
   const client = await pool.connect();
   try {
+    // 1. Identify all columns from the incoming data
+    const inputColumns = Object.keys(schoolsData[0]);
+
     await client.query("BEGIN");
 
-    // 1. Check/Create Table
+    // 2. Check if table exists
     const checkTableQuery = format("SELECT to_regclass(%L)", TABLE_NAME);
     const tableCheckResult = await client.query(checkTableQuery);
 
     if (!tableCheckResult.rows[0].to_regclass) {
-      console.log(`Creating table ${TABLE_NAME} with Hybrid JSONB Schema...`);
+      // CASE A: Table does not exist -> Create it
+      const columnDefinitions = inputColumns
+        .map((col) => {
+            if(col === 'udise_code') return "udise_code TEXT UNIQUE";
+            return format("%I TEXT", col);
+        })
+        .join(", ");
       
-      // Define Core Columns explicitly
-      const columnDefs = CORE_COLUMNS
-        .filter(c => c !== 'local_id') // serial handled separately
-        .map(col => format("%I TEXT", col));
-      
-      // Add the Magic 'details' column for all dynamic data
-      columnDefs.push("details JSONB");
-
       const createTableQuery = format(
         "CREATE TABLE %I (local_id SERIAL PRIMARY KEY, %s)",
         TABLE_NAME,
-        columnDefs.join(", ")
+        columnDefinitions
       );
-      
       await client.query(createTableQuery);
+    } else {
+      // CASE B: Table exists -> Check for missing columns (Schema Migration)
+      const getColQuery = format(
+        "SELECT column_name FROM information_schema.columns WHERE table_name = %L",
+        TABLE_NAME
+      );
+      const existingColsRes = await client.query(getColQuery);
+      const existingCols = new Set(existingColsRes.rows.map(r => r.column_name));
+
+      // Find which columns are new
+      const missingCols = inputColumns.filter(col => !existingCols.has(col));
+
+      if (missingCols.length > 0) {
+        for (const col of missingCols) {
+           // Add missing column dynamically
+           const alterQuery = format("ALTER TABLE %I ADD COLUMN %I TEXT", TABLE_NAME, col);
+           await client.query(alterQuery);
+        }
+      }
+
+      // 3. CONSTRAINT CHECK (Simplified & Robust)
+      // We ensure a UNIQUE INDEX exists on udise_code. This satisfies ON CONFLICT.
+      await client.query(`CREATE UNIQUE INDEX IF NOT EXISTS idx_udise_code_unique ON ${TABLE_NAME} (udise_code)`);
     }
 
-    // 2. Prepare Data for Insertion
-    // We separate incoming data into 'Core' columns and 'Details' object
-    const rowsToInsert = schoolsData.map(school => {
-      const coreData = {};
-      const extraData = {};
-
-      Object.keys(school).forEach(key => {
-        // Lowercase comparison to be safe
-        if (CORE_COLUMNS.includes(key.toLowerCase()) && key !== 'local_id') {
-          coreData[key] = school[key];
-        } else {
-          // If it's not a core column (like caste_general_total_boy), it goes to JSON
-          extraData[key] = school[key];
-        }
+    // 4. Prepare Values (Handle "NA" & Objects)
+    const values = schoolsData.map((school) => {
+      return inputColumns.map((col) => {
+        let val = school[col];
+        // Handle Missing Values -> 'NA'
+        if (val === "" || val === undefined || val === null) return 'NA';
+        // Handle Objects -> JSON String (Prevents DB crash if data isn't flat)
+        if (typeof val === 'object') return JSON.stringify(val);
+        return val;
       });
-
-      // Prepare row values array matching the insert order
-      const rowValues = CORE_COLUMNS
-        .filter(c => c !== 'local_id')
-        .map(col => coreData[col] || null);
-      
-      // Add the JSON string as the last value
-      rowValues.push(JSON.stringify(extraData));
-      
-      return rowValues;
     });
 
-    // 3. Batch Insert
-    // Columns to insert: Core Columns (minus ID) + 'details'
-    const insertCols = [...CORE_COLUMNS.filter(c => c !== 'local_id'), 'details'];
-    
-    const insertQuery = format(
-      "INSERT INTO %I (%I) VALUES %L",
+    // 5. Insert Data
+    const query = format(
+      "INSERT INTO %I (%I) VALUES %L ON CONFLICT (udise_code) DO NOTHING RETURNING local_id",
       TABLE_NAME,
-      insertCols,
-      rowsToInsert
+      inputColumns,
+      values
     );
 
-    // Using basic query for mass insert
-    const result = await client.query(insertQuery);
+    const result = await client.query(query);
     await client.query("COMMIT");
 
     return { success: true, count: result.rowCount };
-
   } catch (err) {
     await client.query("ROLLBACK");
-    console.error("Save Error:", err.message);
-    
-    // Suggest fix if table schema is wrong
-    if (err.message.includes("column") && err.message.includes("does not exist")) {
-      console.error("TIP: Your existing table might be using the old schema. Please DROP TABLE udise_data; and try again.");
-    }
-    
+    console.error("DB Save Error:", err.message);
     throw err;
   } finally {
     client.release();
   }
 };
 
-// --- Service: Search Data (Auto-Flattening) ---
-// This ensures your Frontend DataTable still receives a flat object
+// --- Service: Get Filters ---
+const getFiltersFromDb = async () => {
+  try {
+    const query = format(
+      `SELECT DISTINCT state, district FROM %I WHERE state IS NOT NULL AND state != 'NA' ORDER BY state, district`,
+      TABLE_NAME
+    );
+    const result = await pool.query(query);
+
+    const hierarchy = {};
+    result.rows.forEach((row) => {
+      if (!hierarchy[row.state]) hierarchy[row.state] = [];
+      if (!hierarchy[row.state].includes(row.district))
+        hierarchy[row.state].push(row.district);
+    });
+    return hierarchy;
+  } catch (err) {
+    if (err.code === "42P01") return {}; // Table doesn't exist yet
+    throw err;
+  }
+};
+
+// --- Service: Search Data ---
 const searchSchoolsInDb = async (state, districts) => {
   try {
     let queryText = format("SELECT * FROM %I WHERE 1=1", TABLE_NAME);
@@ -138,67 +171,12 @@ const searchSchoolsInDb = async (state, districts) => {
       queryText += ` AND district = ANY($${paramCounter++})`;
       queryValues.push(districts);
     }
-    
-    queryText += " ORDER BY local_id DESC LIMIT 100";
-    
+    queryText += " LIMIT 100";
     const result = await pool.query(queryText, queryValues);
-    
-    // FLATTEN THE DATA before sending to frontend
-    // The frontend expects { school_name: "...", caste_total_boy: 10 }
-    // The DB returns { school_name: "...", details: { caste_total_boy: 10 } }
-    const flatRows = result.rows.map(row => {
-      const { details, ...coreFields } = row;
-      return { ...coreFields, ...(details || {}) };
-    });
-
-    return flatRows;
+    return result.rows;
   } catch (err) {
-    console.error("Search Error:", err.message);
-    if (err.code === "42P01") return []; // Table doesn't exist
+    if (err.code === "42P01") return [];
     throw err;
-  }
-};
-
-// --- Service: Get Filters ---
-const getFiltersFromDb = async () => {
-  try {
-    // Only core columns need to be queried for filters
-    const query = format(
-      `SELECT DISTINCT state, district FROM %I WHERE state IS NOT NULL ORDER BY state, district`,
-      TABLE_NAME
-    );
-    const result = await pool.query(query);
-
-    const hierarchy = {};
-    result.rows.forEach((row) => {
-      if (!hierarchy[row.state]) hierarchy[row.state] = [];
-      if (!hierarchy[row.state].includes(row.district))
-        hierarchy[row.state].push(row.district);
-    });
-    return hierarchy;
-  } catch (err) {
-    if (err.code === "42P01") return {};
-    throw err;
-  }
-};
-
-// --- Service: Fetch from External UDISE API (Unchanged) ---
-const proxyUdiseRequest = async (method, url, data) => {
-  const targetBaseUrl = "https://kys.udiseplus.gov.in/webapp/api";
-  const targetUrl = `${targetBaseUrl}${url}`;
-  try {
-    const response = await axios({
-      method: method,
-      url: targetUrl,
-      data: method === "POST" || method === "PUT" ? data : undefined,
-      headers: {
-        "User-Agent": "Mozilla/5.0",
-        Accept: "application/json, text/plain, */*",
-      },
-    });
-    return response.data;
-  } catch (error) {
-    throw { status: error.response?.status || 500, message: error.message };
   }
 };
 
@@ -207,4 +185,5 @@ module.exports = {
   saveSchoolsToDb,
   getFiltersFromDb,
   searchSchoolsInDb,
+  getExistingCodes
 };
