@@ -1,0 +1,7 @@
+package-lock.json
+node_modules/
+.udise_data_base_env
+.udise_data_fetcher_env
+dist/
+.vite/
+out/
