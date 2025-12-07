@@ -10,6 +10,9 @@ router.post('/save-schools', schoolController.saveSchools);
 router.get('/filters', schoolController.getFilters);
 router.post('/schools/search', schoolController.searchSchools);
 
+// After existing routes
+router.get('/dashboard/stats', schoolController.getDashboardStats);
+
 // 3. NEW: Check Existing
 router.post('/check-existing', schoolController.checkExisting);
 

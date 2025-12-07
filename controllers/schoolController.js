@@ -81,10 +81,24 @@ const checkExisting = async (req, res) => {
   }
 };
 
+const getDashboardStats = async (req, res) => {
+  try {
+    const stats = await schoolService.getDashboardStats();
+    res.json(stats);
+  } catch (err) {
+    console.error("Dashboard Controller Error:", err);
+    res.status(500).json({ 
+      error: "Failed to fetch dashboard statistics",
+      message: err.message 
+    });
+  }
+};
+
 module.exports = {
   proxyUdise,
   saveSchools,
   getFilters,
   searchSchools,
   checkExisting,
+  getDashboardStats
 };
