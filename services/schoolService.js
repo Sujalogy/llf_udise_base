@@ -18,7 +18,8 @@ const proxyUdiseRequest = async (method, url, data) => {
       url: targetUrl,
       data: method === "POST" || method === "PUT" ? data : undefined,
       headers: {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "User-Agent":
+          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
         Accept: "application/json, text/plain, */*",
         Origin: "https://kys.udiseplus.gov.in",
         Referer: "https://kys.udiseplus.gov.in/",
@@ -29,102 +30,107 @@ const proxyUdiseRequest = async (method, url, data) => {
     if (error.response) {
       throw { status: error.response.status, data: error.response.data };
     }
-    throw { status: 500, message: "Error proxying request", error: error.message };
+    throw {
+      status: 500,
+      message: "Error proxying request",
+      error: error.message,
+    };
   }
 };
 
-// --- Service: Get Existing Codes ---
-const getExistingCodes = async (codes) => {
+const getExistingCodes = async (codes, ay) => {
   if (!codes || codes.length === 0) return [];
   
-  // Check if table exists first
+  // Verify table exists
   const checkTable = await pool.query(format("SELECT to_regclass(%L)", TABLE_NAME));
   if (!checkTable.rows[0].to_regclass) return [];
 
-  const query = format("SELECT udise_code FROM %I WHERE udise_code IN (%L)", TABLE_NAME, codes);
+  // Check if 'ay' column exists
+  const checkCol = await pool.query(
+    format("SELECT column_name FROM information_schema.columns WHERE table_name = %L AND column_name = 'ay'", TABLE_NAME)
+  );
+
+  let query;
+  // If we have an AY string and the column exists, check the pair
+  if (checkCol.rows.length > 0 && ay) {
+    query = format(
+      "SELECT udise_code FROM %I WHERE udise_code IN (%L) AND ay = %L", 
+      TABLE_NAME, codes, ay
+    );
+  } else {
+    // Fallback if no AY provided
+    query = format("SELECT udise_code FROM %I WHERE udise_code IN (%L)", TABLE_NAME, codes);
+  }
+
   const result = await pool.query(query);
   return result.rows.map(r => r.udise_code);
 };
 
-// --- Service: Save Data to DB (Fixed Schema & Constraints) ---
+// 2. UPDATE: saveSchoolsToDb to enforce composite uniqueness
 const saveSchoolsToDb = async (schoolsData) => {
   if (!schoolsData || schoolsData.length === 0) return { success: false, count: 0 };
 
   const client = await pool.connect();
   try {
-    // 1. Identify all columns from the incoming data
     const inputColumns = Object.keys(schoolsData[0]);
-
     await client.query("BEGIN");
 
-    // 2. Check if table exists
+    // Check/Create Table Logic
     const checkTableQuery = format("SELECT to_regclass(%L)", TABLE_NAME);
     const tableCheckResult = await client.query(checkTableQuery);
 
     if (!tableCheckResult.rows[0].to_regclass) {
-      // CASE A: Table does not exist -> Create it
       const columnDefinitions = inputColumns
         .map((col) => {
-            if(col === 'udise_code') return "udise_code TEXT UNIQUE";
-            return format("%I TEXT", col);
+           // Remove UNIQUE from single column definition
+           if(col === 'udise_code') return "udise_code TEXT"; 
+           return format("%I TEXT", col);
         })
         .join(", ");
-      
-      const createTableQuery = format(
-        "CREATE TABLE %I (local_id SERIAL PRIMARY KEY, %s)",
-        TABLE_NAME,
-        columnDefinitions
-      );
-      await client.query(createTableQuery);
+      await client.query(format("CREATE TABLE %I (local_id SERIAL PRIMARY KEY, %s)", TABLE_NAME, columnDefinitions));
     } else {
-      // CASE B: Table exists -> Check for missing columns (Schema Migration)
-      const getColQuery = format(
-        "SELECT column_name FROM information_schema.columns WHERE table_name = %L",
-        TABLE_NAME
-      );
+      // Add Missing Columns
+      const getColQuery = format("SELECT column_name FROM information_schema.columns WHERE table_name = %L", TABLE_NAME);
       const existingColsRes = await client.query(getColQuery);
       const existingCols = new Set(existingColsRes.rows.map(r => r.column_name));
-
-      // Find which columns are new
-      const missingCols = inputColumns.filter(col => !existingCols.has(col));
-
-      if (missingCols.length > 0) {
-        for (const col of missingCols) {
-           // Add missing column dynamically
-           const alterQuery = format("ALTER TABLE %I ADD COLUMN %I TEXT", TABLE_NAME, col);
-           await client.query(alterQuery);
+      for (const col of inputColumns) {
+        if (!existingCols.has(col)) {
+           await client.query(format("ALTER TABLE %I ADD COLUMN %I TEXT", TABLE_NAME, col));
         }
       }
-
-      // 3. CONSTRAINT CHECK (Simplified & Robust)
-      // We ensure a UNIQUE INDEX exists on udise_code. This satisfies ON CONFLICT.
-      await client.query(`CREATE UNIQUE INDEX IF NOT EXISTS idx_udise_code_unique ON ${TABLE_NAME} (udise_code)`);
     }
 
-    // 4. Prepare Values (Handle "NA" & Objects)
-    const values = schoolsData.map((school) => {
-      return inputColumns.map((col) => {
-        let val = school[col];
-        // Handle Missing Values -> 'NA'
-        if (val === "" || val === undefined || val === null) return 'NA';
-        // Handle Objects -> JSON String (Prevents DB crash if data isn't flat)
-        if (typeof val === 'object') return JSON.stringify(val);
-        return val;
-      });
-    });
+    // --- CRITICAL: COMPOSITE UNIQUE INDEX (UDISE_CODE + AY) ---
+    // Drop old index if exists
+    await client.query(`DROP INDEX IF EXISTS idx_udise_code_unique`);
+    
+    // Create new composite index
+    if (inputColumns.includes('ay')) {
+        await client.query(`CREATE UNIQUE INDEX IF NOT EXISTS idx_udise_ay_unique ON ${TABLE_NAME} (udise_code, ay)`);
+        
+        const values = schoolsData.map(school => inputColumns.map(col => {
+            let val = school[col];
+            if (val === "" || val === undefined || val === null) return 'NA';
+            if (typeof val === 'object') return JSON.stringify(val);
+            return val;
+        }));
 
-    // 5. Insert Data
-    const query = format(
-      "INSERT INTO %I (%I) VALUES %L ON CONFLICT (udise_code) DO NOTHING RETURNING local_id",
-      TABLE_NAME,
-      inputColumns,
-      values
-    );
-
+        const query = format(
+          "INSERT INTO %I (%I) VALUES %L ON CONFLICT (udise_code, ay) DO NOTHING RETURNING local_id",
+          TABLE_NAME, inputColumns, values
+        );
+        const result = await client.query(query);
+        await client.query("COMMIT");
+        return { success: true, count: result.rowCount };
+    } 
+    
+    // Fallback (for old data structure)
+    const values = schoolsData.map(s => inputColumns.map(c => typeof s[c] === 'object' ? JSON.stringify(s[c]) : (s[c] || 'NA')));
+    const query = format("INSERT INTO %I (%I) VALUES %L ON CONFLICT (udise_code) DO NOTHING RETURNING local_id", TABLE_NAME, inputColumns, values);
     const result = await client.query(query);
     await client.query("COMMIT");
-
     return { success: true, count: result.rowCount };
+
   } catch (err) {
     await client.query("ROLLBACK");
     console.error("DB Save Error:", err.message);
@@ -182,13 +188,13 @@ const searchSchoolsInDb = async (state, districts) => {
 
 const getDashboardStats = async () => {
   const TABLE_NAME = "udise_data";
-  
+
   try {
     // Check if table exists
     const checkTable = await pool.query(
       format("SELECT to_regclass(%L)", TABLE_NAME)
     );
-    
+
     if (!checkTable.rows[0].to_regclass) {
       // Return empty stats if table doesn't exist
       return {
@@ -217,14 +223,14 @@ const getDashboardStats = async () => {
        WHERE table_name = $1`,
       [TABLE_NAME]
     );
-    
-    const existingColumns = columnsQuery.rows.map(r => r.column_name);
-    
+
+    const existingColumns = columnsQuery.rows.map((r) => r.column_name);
+
     // Helper function to find the actual column name (case-insensitive)
     const findColumn = (possibleNames) => {
       for (const name of possibleNames) {
         const found = existingColumns.find(
-          col => col.toLowerCase() === name.toLowerCase()
+          (col) => col.toLowerCase() === name.toLowerCase()
         );
         if (found) return found;
       }
@@ -232,16 +238,28 @@ const getDashboardStats = async () => {
     };
 
     // Identify correct column names
-    const totalStudentsCol = findColumn(['totalStudents', 'total_students', 'totalstudents']);
-    const boyStudentsCol = findColumn(['totalBoyStudents', 'total_boy', 'totalboystudents']);
-    const girlStudentsCol = findColumn(['totalGirlStudents', 'total_girl', 'totalgirlstudents']);
+    const totalStudentsCol = findColumn([
+      "totalStudents",
+      "total_students",
+      "totalstudents",
+    ]);
+    const boyStudentsCol = findColumn([
+      "totalBoyStudents",
+      "total_boy",
+      "totalboystudents",
+    ]);
+    const girlStudentsCol = findColumn([
+      "totalGirlStudents",
+      "total_girl",
+      "totalgirlstudents",
+    ]);
 
     // Build the student sum query dynamically
     let studentSumQuery = "SELECT 0 as total, 0 as boys, 0 as girls";
-    
+
     if (totalStudentsCol || boyStudentsCol || girlStudentsCol) {
       const parts = [];
-      
+
       if (totalStudentsCol) {
         parts.push(`
           COALESCE(
@@ -339,7 +357,7 @@ const getDashboardStats = async () => {
     ] = await Promise.all([
       // Total Records
       pool.query(format("SELECT COUNT(*) as count FROM %I", TABLE_NAME)),
-      
+
       // Unique UDISE Codes
       pool.query(
         format(
@@ -347,7 +365,7 @@ const getDashboardStats = async () => {
           TABLE_NAME
         )
       ),
-      
+
       // Unique States
       pool.query(
         format(
@@ -355,7 +373,7 @@ const getDashboardStats = async () => {
           TABLE_NAME
         )
       ),
-      
+
       // Unique Districts
       pool.query(
         format(
@@ -363,7 +381,7 @@ const getDashboardStats = async () => {
           TABLE_NAME
         )
       ),
-      
+
       // Unique Blocks
       pool.query(
         format(
@@ -371,7 +389,7 @@ const getDashboardStats = async () => {
           TABLE_NAME
         )
       ),
-      
+
       // Unique Clusters
       pool.query(
         format(
@@ -379,7 +397,7 @@ const getDashboardStats = async () => {
           TABLE_NAME
         )
       ),
-      
+
       // Unique Villages
       pool.query(
         format(
@@ -387,10 +405,10 @@ const getDashboardStats = async () => {
           TABLE_NAME
         )
       ),
-      
+
       // Total Students (using dynamic query built above)
       pool.query(studentSumQuery),
-      
+
       // Top 5 States by school count
       pool.query(
         format(
@@ -403,7 +421,7 @@ const getDashboardStats = async () => {
           TABLE_NAME
         )
       ),
-      
+
       // Top 5 Districts by school count
       pool.query(
         format(
@@ -416,7 +434,7 @@ const getDashboardStats = async () => {
           TABLE_NAME
         )
       ),
-      
+
       // Top 5 Blocks by school count
       pool.query(
         format(
@@ -429,7 +447,7 @@ const getDashboardStats = async () => {
           TABLE_NAME
         )
       ),
-      
+
       // Schools by Category
       pool.query(
         format(
@@ -442,7 +460,7 @@ const getDashboardStats = async () => {
           TABLE_NAME
         )
       ),
-      
+
       // Schools by Management
       pool.query(
         format(
@@ -457,7 +475,11 @@ const getDashboardStats = async () => {
       ),
     ]);
 
-    const studentData = totalStudentsResult.rows[0] || { total: 0, boys: 0, girls: 0 };
+    const studentData = totalStudentsResult.rows[0] || {
+      total: 0,
+      boys: 0,
+      girls: 0,
+    };
 
     return {
       totalRecords: parseInt(totalRecordsResult.rows[0]?.count || 0),
@@ -470,25 +492,25 @@ const getDashboardStats = async () => {
       totalStudents: parseInt(studentData.total || 0),
       totalBoyStudents: parseInt(studentData.boys || 0),
       totalGirlStudents: parseInt(studentData.girls || 0),
-      topStates: topStatesResult.rows.map(r => ({
+      topStates: topStatesResult.rows.map((r) => ({
         name: r.name,
-        count: parseInt(r.count)
+        count: parseInt(r.count),
       })),
-      topDistricts: topDistrictsResult.rows.map(r => ({
+      topDistricts: topDistrictsResult.rows.map((r) => ({
         name: r.name,
-        count: parseInt(r.count)
+        count: parseInt(r.count),
       })),
-      topBlocks: topBlocksResult.rows.map(r => ({
+      topBlocks: topBlocksResult.rows.map((r) => ({
         name: r.name,
-        count: parseInt(r.count)
+        count: parseInt(r.count),
       })),
-      schoolsByCategory: schoolsByCategoryResult.rows.map(r => ({
+      schoolsByCategory: schoolsByCategoryResult.rows.map((r) => ({
         category: r.category,
-        count: parseInt(r.count)
+        count: parseInt(r.count),
       })),
-      schoolsByManagement: schoolsByManagementResult.rows.map(r => ({
+      schoolsByManagement: schoolsByManagementResult.rows.map((r) => ({
         management: r.management,
-        count: parseInt(r.count)
+        count: parseInt(r.count),
       })),
     };
   } catch (err) {
@@ -504,5 +526,5 @@ module.exports = {
   getFiltersFromDb,
   searchSchoolsInDb,
   getExistingCodes,
-  getDashboardStats,  // Make sure this is exported
+  getDashboardStats, // Make sure this is exported
 };

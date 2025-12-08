@@ -69,11 +69,12 @@ const searchSchools = async (req, res) => {
 // NEW: Check for Existing Codes
 const checkExisting = async (req, res) => {
   try {
-    const { codes } = req.body;
+    const { codes, ay } = req.body; // Extract 'ay' from request
     if (!codes || !Array.isArray(codes))
       return res.status(400).json({ error: "Invalid codes array" });
 
-    const existingCodes = await schoolService.getExistingCodes(codes);
+    // Pass 'ay' to service
+    const existingCodes = await schoolService.getExistingCodes(codes, ay);
     res.json({ existing: existingCodes });
   } catch (err) {
     console.error(err);
