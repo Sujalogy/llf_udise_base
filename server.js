@@ -6,31 +6,30 @@ const schoolRoutes = require('./routes/schoolRoutes');
 const app = express();
 const PORT = 3000;
 
-// --- Middleware ---
-app.use(cors());
+app.use(cors({ origin: ['http://localhost:5173', 'http://localhost:5174'], credentials: true }));
 app.use(express.json({ limit: '50mb' }));
 
-// --- Database Connection Check ---
 pool.query('SELECT NOW()', (err, res) => {
   if (err) {
-    console.error('------------------------------------------------');
-    console.error('❌ DATABASE CONNECTION FAILED');
-    console.error('Error:', err.message);
-    console.error('------------------------------------------------');
+    console.error('❌ DATABASE CONNECTION FAILED:', err.message);
   } else {
-    console.log('------------------------------------------------');
-    console.log('✅ DATABASE CONNECTED SUCCESSFULLY');
-    console.log(`Timestamp: ${res.rows[0].now}`);
-    console.log('------------------------------------------------');
+    console.log('✅ DATABASE CONNECTED:', res.rows[0].now);
   }
 });
 
-// --- Mount Routes ---
-// This will prefix all routes in schoolRoutes with /api
-// e.g., /api/udise, /api/save-schools
 app.use('/api', schoolRoutes);
 
-// --- Start Server ---
+// Token cleanup cron
+setInterval(async () => {
+  try {
+    const authService = require('./services/authService');
+    const deleted = await authService.cleanupExpiredTokens();
+    console.log(`🗑️ Cleaned up ${deleted} expired tokens`);
+  } catch (error) {
+    console.error('Token cleanup failed:', error);
+  }
+}, 60 * 60 * 1000);
+
 app.listen(PORT, () => {
-  console.log(`Server running on http://localhost:${PORT}`);
+  console.log(`🚀 Server: http://localhost:${PORT}`);
 });

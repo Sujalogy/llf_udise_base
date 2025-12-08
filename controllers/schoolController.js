@@ -84,14 +84,32 @@ const checkExisting = async (req, res) => {
 
 const getDashboardStats = async (req, res) => {
   try {
-    const stats = await schoolService.getDashboardStats();
+    const { state, district, block, ay } = req.query;
+    const stats = await schoolService.getDashboardStats({ state, district, block, ay });
     res.json(stats);
   } catch (err) {
     console.error("Dashboard Controller Error:", err);
-    res.status(500).json({ 
-      error: "Failed to fetch dashboard statistics",
-      message: err.message 
-    });
+    res.status(500).json({ error: "Failed to fetch dashboard statistics", message: err.message });
+  }
+};
+
+const getAcademicYears = async (req, res) => {
+  try {
+    const years = await schoolService.getAcademicYears();
+    res.json({ success: true, academicYears: years });
+  } catch (err) {
+    console.error("Get Academic Years Error:", err);
+    res.status(500).json({ error: "Failed to fetch academic years" });
+  }
+};
+
+const getAllFilterOptions = async (req, res) => {
+  try {
+    const options = await schoolService.getAllFilterOptions();
+    res.json({ success: true, ...options });
+  } catch (err) {
+    console.error("Get Filter Options Error:", err);
+    res.status(500).json({ error: "Failed to fetch filter options" });
   }
 };
 
@@ -101,5 +119,7 @@ module.exports = {
   getFilters,
   searchSchools,
   checkExisting,
-  getDashboardStats
+  getDashboardStats,
+  getAcademicYears,
+  getAllFilterOptions
 };
