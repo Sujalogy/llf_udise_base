@@ -255,8 +255,9 @@ const getDashboardStats = async (filters = {}) => {
       params.push(ay);
     }
 
-    const whereClause =
-      conditions.length > 0 ? `WHERE ${conditions.join(" AND ")}` : "";
+    const whereClause = `WHERE 1=1 ${
+      conditions.length > 0 ? `AND ${conditions.join(" AND ")}` : ""
+    }`;
 
     const [
       totalRecordsResult,
@@ -304,7 +305,7 @@ const getDashboardStats = async (filters = {}) => {
       ),
       pool.query(
         format(
-          "SELECT COUNT(DISTINCT ay) as count FROM %I %s AND ay IS NOT NULL",
+          "SELECT COUNT(DISTINCT ay) as count FROM %I %s AND ay IS NOT NULL AND ay != 'NA'",
           TABLE_NAME,
           whereClause
         ),
