@@ -1,12 +1,13 @@
 const { Pool } = require('pg');
+require('dotenv').config();
 
 // Database Configuration
 const pool = new Pool({
-  user: 'postgres',      // Your PostgreSQL username
-  host: 'localhost',
-  database: 'Udise_database', // Your Database name
-  password: 'secret',    // Your Password
-  port: 5432,
+  user: process.env.DB_USER,
+  host: process.env.DB_HOST,
+  database: process.env.DB_NAME,
+  password: process.env.DB_PASSWORD,
+  port: process.env.DB_PORT,
 });
 
 // Listener for unexpected errors on idle clients

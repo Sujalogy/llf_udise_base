@@ -1,3 +1,6 @@
+// ============================================================================
+// --- FILE: controllers/schoolController.js ---
+// ============================================================================
 const schoolService = require("../services/schoolService");
 
 const proxyUdise = async (req, res) => {
@@ -33,7 +36,6 @@ const saveSchools = async (req, res) => {
     });
   } catch (err) {
     console.error("Controller Error:", err);
-    // Handle Duplicate Key Error gracefully
     if (err.code === "23505") {
       return res.json({
         success: true,
@@ -56,24 +58,28 @@ const getFilters = async (req, res) => {
   }
 };
 
+// --- UPDATED: Search with Pagination ---
 const searchSchools = async (req, res) => {
   try {
-    const { state, districts } = req.body;
-    const data = await schoolService.searchSchoolsInDb(state, districts);
-    res.json(data);
+    const { state, districts, page, limit } = req.body;
+    const pageNum = parseInt(page) || 1;
+    const limitNum = parseInt(limit) || 50;
+
+    const result = await schoolService.searchSchoolsInDb(state, districts, pageNum, limitNum);
+    
+    // Result contains { data, total, page, limit }
+    res.json(result); 
   } catch (err) {
     res.status(500).json({ error: "Failed to fetch data" });
   }
 };
 
-// NEW: Check for Existing Codes
 const checkExisting = async (req, res) => {
   try {
-    const { codes, ay } = req.body; // Extract 'ay' from request
+    const { codes, ay } = req.body; 
     if (!codes || !Array.isArray(codes))
       return res.status(400).json({ error: "Invalid codes array" });
 
-    // Pass 'ay' to service
     const existingCodes = await schoolService.getExistingCodes(codes, ay);
     res.json({ existing: existingCodes });
   } catch (err) {

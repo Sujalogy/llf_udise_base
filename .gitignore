@@ -6,3 +6,4 @@ dist/
 .vite/
 out/
 query.sql
+.env

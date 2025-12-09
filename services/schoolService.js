@@ -1,5 +1,5 @@
 // ============================================================================
-// --- FILE: services/schoolService.js ---
+// --- FILE: services/schoolService.js (FIXED) ---
 // ============================================================================
 const pool = require("../db");
 const format = require("pg-format");
@@ -77,7 +77,6 @@ const getExistingCodes = async (codes, ay) => {
   return result.rows.map((r) => r.udise_code);
 };
 
-// 2. UPDATE: saveSchoolsToDb to enforce composite uniqueness
 const saveSchoolsToDb = async (schoolsData) => {
   if (!schoolsData || schoolsData.length === 0)
     return { success: false, count: 0 };
@@ -94,7 +93,6 @@ const saveSchoolsToDb = async (schoolsData) => {
     if (!tableCheckResult.rows[0].to_regclass) {
       const columnDefinitions = inputColumns
         .map((col) => {
-          // Remove UNIQUE from single column definition
           if (col === "udise_code") return "udise_code TEXT";
           return format("%I TEXT", col);
         })
@@ -126,10 +124,8 @@ const saveSchoolsToDb = async (schoolsData) => {
     }
 
     // --- CRITICAL: COMPOSITE UNIQUE INDEX (UDISE_CODE + AY) ---
-    // Drop old index if exists
     await client.query(`DROP INDEX IF EXISTS idx_udise_code_unique`);
 
-    // Create new composite index
     if (inputColumns.includes("ay")) {
       await client.query(
         `CREATE UNIQUE INDEX IF NOT EXISTS idx_udise_ay_unique ON ${TABLE_NAME} (udise_code, ay)`
@@ -155,7 +151,7 @@ const saveSchoolsToDb = async (schoolsData) => {
       return { success: true, count: result.rowCount };
     }
 
-    // Fallback (for old data structure)
+    // Fallback
     const values = schoolsData.map((s) =>
       inputColumns.map((c) =>
         typeof s[c] === "object" ? JSON.stringify(s[c]) : s[c] || "NA"
@@ -179,7 +175,6 @@ const saveSchoolsToDb = async (schoolsData) => {
   }
 };
 
-// --- Service: Get Filters ---
 const getFiltersFromDb = async () => {
   try {
     const query = format(
@@ -196,31 +191,57 @@ const getFiltersFromDb = async () => {
     });
     return hierarchy;
   } catch (err) {
-    if (err.code === "42P01") return {}; // Table doesn't exist yet
+    if (err.code === "42P01") return {};
     throw err;
   }
 };
 
-// --- Service: Search Data ---
-const searchSchoolsInDb = async (state, districts) => {
+// --- UPDATED: Search Data with Pagination & Total Count ---
+const searchSchoolsInDb = async (state, districts, page = 1, limit = 50) => {
   try {
-    let queryText = format("SELECT * FROM %I WHERE 1=1", TABLE_NAME);
+    const offset = (page - 1) * limit;
+    
+    // Base Query Components
+    let whereClause = "WHERE 1=1";
     const queryValues = [];
     let paramCounter = 1;
 
     if (state) {
-      queryText += ` AND state = $${paramCounter++}`;
+      whereClause += ` AND state = $${paramCounter++}`;
       queryValues.push(state);
     }
     if (districts && districts.length > 0) {
-      queryText += ` AND district = ANY($${paramCounter++})`;
+      whereClause += ` AND district = ANY($${paramCounter++})`;
       queryValues.push(districts);
     }
-    queryText += " LIMIT 100";
-    const result = await pool.query(queryText, queryValues);
-    return result.rows;
+
+    // 1. Get Total Count (for infinite scroll calculation)
+    const countQuery = format("SELECT COUNT(*) as total FROM %I %s", TABLE_NAME, whereClause);
+    const countResult = await pool.query(countQuery, queryValues); // Use same values
+    const totalRecords = parseInt(countResult.rows[0].total || 0);
+
+    // 2. Get Paged Data
+    // FIXED: Uses backticks ` ` for template literal interpolation
+    const dataQuery = format(
+      `SELECT * FROM %I %s LIMIT $${paramCounter++} OFFSET $${paramCounter++}`, 
+      TABLE_NAME, 
+      whereClause
+    );
+    
+    // Add pagination params
+    const dataValues = [...queryValues, limit, offset];
+    const dataResult = await pool.query(dataQuery, dataValues);
+
+    return {
+      data: dataResult.rows,
+      total: totalRecords,
+      page: parseInt(page),
+      limit: parseInt(limit)
+    };
+
   } catch (err) {
-    if (err.code === "42P01") return [];
+    console.error("Search DB Error:", err); // Added error logging
+    if (err.code === "42P01") return { data: [], total: 0 };
     throw err;
   }
 };
@@ -259,12 +280,15 @@ const getDashboardStats = async (filters = {}) => {
       conditions.length > 0 ? `AND ${conditions.join(" AND ")}` : ""
     }`;
 
+    // Basic Counts
     const [
       totalRecordsResult,
       uniqueUdiseResult,
       uniqueStatesResult,
       uniqueDistrictsResult,
       uniqueBlocksResult,
+      uniqueClustersResult,
+      uniqueVillagesResult,
       uniqueAYResult,
     ] = await Promise.all([
       pool.query(
@@ -305,6 +329,22 @@ const getDashboardStats = async (filters = {}) => {
       ),
       pool.query(
         format(
+          "SELECT COUNT(DISTINCT cluster) as count FROM %I %s",
+          TABLE_NAME,
+          whereClause
+        ),
+        params
+      ),
+      pool.query(
+        format(
+          "SELECT COUNT(DISTINCT village) as count FROM %I %s",
+          TABLE_NAME,
+          whereClause
+        ),
+        params
+      ),
+      pool.query(
+        format(
           "SELECT COUNT(DISTINCT ay) as count FROM %I %s AND ay IS NOT NULL AND ay != 'NA'",
           TABLE_NAME,
           whereClause
@@ -313,13 +353,102 @@ const getDashboardStats = async (filters = {}) => {
       ),
     ]);
 
+    // Student Calculations
+    const studentQuery = `
+      SELECT 
+        SUM(
+          COALESCE(CAST(NULLIF("totalStudents", 'NA') AS INTEGER), 0) +
+          COALESCE(CAST(NULLIF(total_students, 'NA') AS INTEGER), 0) +
+          COALESCE(CAST(NULLIF(caste_total, 'NA') AS INTEGER), 0)
+        ) as total_students,
+        SUM(
+          COALESCE(CAST(NULLIF("totalBoyStudents", 'NA') AS INTEGER), 0) +
+          COALESCE(CAST(NULLIF(caste_total_boy, 'NA') AS INTEGER), 0)
+        ) as total_boy_students,
+        SUM(
+          COALESCE(CAST(NULLIF("totalGirlStudents", 'NA') AS INTEGER), 0) +
+          COALESCE(CAST(NULLIF(caste_total_girl, 'NA') AS INTEGER), 0)
+        ) as total_girl_students
+      FROM ${TABLE_NAME}
+      ${whereClause}
+    `;
+
+    const studentResult = await pool.query(studentQuery, params);
+
+    // Top States
+    const topStatesQuery = `
+      SELECT state as name, COUNT(*) as count 
+      FROM ${TABLE_NAME}
+      ${whereClause}
+      GROUP BY state
+      ORDER BY count DESC
+      LIMIT 5
+    `;
+    const topStatesResult = await pool.query(topStatesQuery, params);
+
+    // Top Districts
+    const topDistrictsQuery = `
+      SELECT district as name, COUNT(*) as count 
+      FROM ${TABLE_NAME}
+      ${whereClause}
+      GROUP BY district
+      ORDER BY count DESC
+      LIMIT 5
+    `;
+    const topDistrictsResult = await pool.query(topDistrictsQuery, params);
+
+    // Top Blocks
+    const topBlocksQuery = `
+      SELECT block as name, COUNT(*) as count 
+      FROM ${TABLE_NAME}
+      ${whereClause}
+      GROUP BY block
+      ORDER BY count DESC
+      LIMIT 5
+    `;
+    const topBlocksResult = await pool.query(topBlocksQuery, params);
+
+    // Schools by Category
+    const categoryQuery = `
+      SELECT school_category as category, COUNT(*) as count
+      FROM ${TABLE_NAME}
+      ${whereClause}
+      GROUP BY school_category
+      ORDER BY count DESC
+    `;
+    const categoryResult = await pool.query(categoryQuery, params);
+
+    // Schools by Management
+    const managementQuery = `
+      SELECT school_management as management, COUNT(*) as count
+      FROM ${TABLE_NAME}
+      ${whereClause}
+      GROUP BY school_management
+      ORDER BY count DESC
+    `;
+    const managementResult = await pool.query(managementQuery, params);
+
     return {
       totalRecords: parseInt(totalRecordsResult.rows[0]?.count || 0),
       uniqueUdise: parseInt(uniqueUdiseResult.rows[0]?.count || 0),
       uniqueStates: parseInt(uniqueStatesResult.rows[0]?.count || 0),
       uniqueDistricts: parseInt(uniqueDistrictsResult.rows[0]?.count || 0),
       uniqueBlocks: parseInt(uniqueBlocksResult.rows[0]?.count || 0),
+      uniqueClusters: parseInt(uniqueClustersResult.rows[0]?.count || 0),
+      uniqueVillages: parseInt(uniqueVillagesResult.rows[0]?.count || 0),
       uniqueAcademicYears: parseInt(uniqueAYResult.rows[0]?.count || 0),
+      totalStudents: parseInt(studentResult.rows[0]?.total_students || 0),
+      totalBoyStudents: parseInt(
+        studentResult.rows[0]?.total_boy_students || 0
+      ),
+      totalGirlStudents: parseInt(
+        studentResult.rows[0]?.total_girl_students || 0
+      ),
+      topStates: topStatesResult.rows,
+      topDistricts: topDistrictsResult.rows,
+      topBlocks: topBlocksResult.rows,
+      schoolsByCategory: categoryResult.rows,
+      schoolsByManagement: managementResult.rows,
       appliedFilters: { state, district, block, ay },
     };
   } catch (err) {
@@ -414,19 +543,28 @@ function getEmptyStats() {
     uniqueStates: 0,
     uniqueDistricts: 0,
     uniqueBlocks: 0,
+    uniqueClusters: 0,
+    uniqueVillages: 0,
     uniqueAcademicYears: 0,
+    totalStudents: 0,
+    totalBoyStudents: 0,
+    totalGirlStudents: 0,
+    topStates: [],
+    topDistricts: [],
+    topBlocks: [],
+    schoolsByCategory: [],
+    schoolsByManagement: [],
     appliedFilters: {},
   };
 }
 
-// UPDATE module.exports at the end:
 module.exports = {
   proxyUdiseRequest,
   saveSchoolsToDb,
   getFiltersFromDb,
   searchSchoolsInDb,
   getExistingCodes,
-  getDashboardStats, // ADD
-  getAcademicYears, // ADD
-  getAllFilterOptions, // ADD
+  getDashboardStats,
+  getAcademicYears,
+  getAllFilterOptions,
 };
